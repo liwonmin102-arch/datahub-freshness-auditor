@@ -72,3 +72,42 @@ python level2_write_back.py
 ### After Running
 
 Search for `nyc_taxi_pipeline` or `freshness` in the DataHub UI at `localhost:9002` to see the registered datasets, lineage graph, and freshness tags.
+
+## Level 3: Freshness Audit Agent
+
+The main demo script. A human-triggered agent that reads from DataHub, queries real data for evidence, gets an LLM diagnosis, then **acts** — updating DataHub and alerting owners.
+
+### What It Does
+
+1. **Reads FROM DataHub** (GraphQL) — fetches all 3 datasets with their tags, descriptions, lineage, and custom properties
+2. **Queries real data** (SQLite) — MAX timestamps, daily row counts, date gap detection, empty load detection, cross-stage row count comparison
+3. **LLM diagnosis** (Nebius DeepSeek-R1) — sends DataHub metadata + real evidence, gets back structured JSON with severity ratings and recommended actions. Falls back to rule-based diagnosis if `NEBIUS_API_KEY` is not set.
+4. **Acts on findings:**
+   - Updates DataHub tags based on diagnosis severity
+   - Writes incident reports as dataset descriptions in DataHub
+   - Prints Slack-style alerts addressed to `@data_platform_team`
+5. **Saves audit report** — full Markdown report with issue table, evidence, and actions taken
+
+### Key Difference from Level 1-2
+
+| | Level 1 | Level 2 | Level 3 |
+|---|---------|---------|---------|
+| **Reads from** | SQLite only | SQLite only | DataHub + SQLite |
+| **LLM role** | Generate plan | (none) | Diagnose issues |
+| **Writes to** | Console/file | DataHub | DataHub (updates) |
+| **Actions** | None | Register datasets | Update tags, alert owners |
+
+### Run
+
+```bash
+# With LLM diagnosis:
+export NEBIUS_API_KEY="your-key"
+python level3_freshness_agent.py
+
+# Without LLM (rule-based fallback):
+python level3_freshness_agent.py
+```
+
+### Sample Output
+
+The agent produces colored terminal output with 5 clear phases, Slack-style alert blocks, and saves a detailed Markdown report to `reports/freshness_audit_<timestamp>.md`.
