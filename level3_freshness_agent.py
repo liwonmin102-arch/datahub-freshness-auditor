@@ -13,6 +13,7 @@ Human-triggered agent that:
 
 import json
 import os
+import re
 import sqlite3
 import sys
 import textwrap
@@ -608,10 +609,67 @@ def build_fallback_diagnosis(evidence):
     }
 
 
+MAX_LLM_RETRIES = 3
+
+RETRY_SUFFIX = (
+    "\n\nIMPORTANT: You MUST respond with valid JSON only. "
+    "No markdown, no backticks, no explanation outside the JSON. "
+    "Do not wrap the JSON in ```json``` fences. "
+    "Start your response with { and end with }."
+)
+
+
+def _extract_json(raw_text):
+    """Extract a JSON object from raw LLM text.
+
+    Handles: <think> tags, markdown fences, leading/trailing prose.
+    Returns the parsed dict or raises ValueError.
+    """
+    # Strip <think>...</think> blocks (DeepSeek-R1 reasoning traces)
+    cleaned = re.sub(r"<think>.*?</think>", "", raw_text, flags=re.DOTALL)
+    cleaned = cleaned.strip()
+
+    # Strip markdown code fences (```json ... ``` or ``` ... ```)
+    fence_match = re.search(
+        r"```(?:json)?\s*\n?(.*?)\n?\s*```", cleaned, flags=re.DOTALL
+    )
+    if fence_match:
+        cleaned = fence_match.group(1).strip()
+
+    # Try direct parse first
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+
+    # Find the outermost { ... } by matching braces
+    start = cleaned.find("{")
+    if start == -1:
+        raise ValueError("No JSON object found in response")
+
+    depth = 0
+    end = -1
+    for i in range(start, len(cleaned)):
+        if cleaned[i] == "{":
+            depth += 1
+        elif cleaned[i] == "}":
+            depth -= 1
+            if depth == 0:
+                end = i + 1
+                break
+
+    if end == -1:
+        raise ValueError("Unbalanced braces in response")
+
+    return json.loads(cleaned[start:end])
+
+
 def call_nebius_diagnosis(context, evidence):
     """Send findings to Nebius LLM for structured diagnosis.
 
-    Falls back to rule-based diagnosis if NEBIUS_API_KEY is not set.
+    Retry up to 3 times with increasingly strict prompts.
+    Falls back to rule-based diagnosis if the LLM is unavailable or
+    all retries fail.
     """
     api_key = os.environ.get("NEBIUS_API_KEY")
     if not api_key:
@@ -620,46 +678,53 @@ def call_nebius_diagnosis(context, evidence):
 
     client = OpenAI(base_url=NEBIUS_BASE_URL, api_key=api_key)
 
-    info("Sending findings to Nebius LLM (DeepSeek-R1-0528)…")
-    response = client.chat.completions.create(
-        model=NEBIUS_MODEL,
-        temperature=0.3,
-        max_tokens=4096,
-        messages=[
-            {"role": "system", "content": DIAGNOSIS_SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": (
-                    "Run a freshness audit on this pipeline. Compare the "
-                    "DataHub catalog metadata against the real query results "
-                    "and produce a structured diagnosis.\n\n" + context
-                ),
-            },
-        ],
+    user_message = (
+        "Run a freshness audit on this pipeline. Compare the "
+        "DataHub catalog metadata against the real query results "
+        "and produce a structured diagnosis.\n\n" + context
     )
 
-    raw_text = response.choices[0].message.content
+    for attempt in range(1, MAX_LLM_RETRIES + 1):
+        try:
+            prompt = DIAGNOSIS_SYSTEM_PROMPT
+            if attempt > 1:
+                prompt += RETRY_SUFFIX
+                warn(f"Retry {attempt}/{MAX_LLM_RETRIES} with stricter prompt")
 
-    # Strip <think>...</think> blocks (DeepSeek-R1 reasoning)
-    import re
-    cleaned = re.sub(r"<think>.*?</think>", "", raw_text, flags=re.DOTALL).strip()
+            info(f"Sending findings to Nebius LLM (attempt {attempt}/{MAX_LLM_RETRIES})…")
+            response = client.chat.completions.create(
+                model=NEBIUS_MODEL,
+                temperature=max(0.1, 0.3 - (attempt - 1) * 0.1),
+                max_tokens=4096,
+                messages=[
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": user_message},
+                ],
+            )
 
-    # Strip markdown fences if present
-    if cleaned.startswith("```"):
-        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
-        cleaned = re.sub(r"\s*```$", "", cleaned)
+            raw_text = response.choices[0].message.content or ""
+            result = _extract_json(raw_text)
 
-    try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
-        warn("LLM returned non-JSON — attempting to extract JSON block")
-        # Try to find a JSON object in the response
-        match = re.search(r"\{[\s\S]*\}", cleaned)
-        if match:
-            return json.loads(match.group(0))
-        fail("Could not parse LLM response as JSON")
-        print(f"\n{C.DIM}Raw response:{C.RESET}\n{raw_text[:500]}")
-        sys.exit(1)
+            # Validate required keys
+            if "pipeline_health" not in result or "issues" not in result:
+                raise ValueError("Missing required keys: pipeline_health, issues")
+            if not isinstance(result["issues"], list):
+                raise ValueError("'issues' must be a list")
+
+            ok(f"LLM response parsed successfully (attempt {attempt})")
+            return result
+
+        except (json.JSONDecodeError, ValueError) as exc:
+            warn(f"Attempt {attempt} failed: {exc}")
+            if attempt < MAX_LLM_RETRIES:
+                info("Retrying with stricter prompt…")
+            continue
+        except Exception as exc:
+            fail(f"LLM API error: {exc}")
+            break
+
+    warn("All LLM attempts failed — falling back to rule-based diagnosis")
+    return build_fallback_diagnosis(evidence)
 
 
 # ---------------------------------------------------------------------------

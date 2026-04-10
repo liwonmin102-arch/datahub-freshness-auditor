@@ -1,106 +1,95 @@
-# Data Freshness Auditor
+# Data Freshness Auditor — DataHub x Nebius Hackathon
 
-**DataHub x Nebius Hackathon — Problem 3**
+**Problem 3: Data Freshness Auditor**
 
-Automated detection and diagnosis of stale data in multi-stage pipelines.
+A 3-level system that audits data pipeline freshness using **DataHub** as the metadata/context layer and **Nebius** (DeepSeek-R1) as the reasoning engine. It detects stale data, diagnoses root causes, and takes corrective actions automatically.
 
-## Level 1: Freshness Verification Plan
-
-Reads pipeline metadata from a SQLite database, builds a structured context, and uses a Nebius-hosted LLM (DeepSeek-R1) to generate a prioritized **Freshness Verification Plan**.
-
-### Pipeline Under Test
+## Architecture
 
 ```
-raw_trips (250k rows) → staging_trips (208k rows) → mart_daily_summary (41 rows)
+┌─────────────────────────────────────────────────────────────────────┐
+│                     NYC Taxi Data Pipeline                          │
+│                                                                     │
+│   raw_trips (250k) ──→ staging_trips (208k) ──→ mart_daily_summary │
+│   through 2016-03-10    through 2016-03-01       through 2016-03-01│
+│        ✅ OK              ❌ 9 DAYS STALE          ❌ STALE          │
+└─────────────────────────────────────────────────────────────────────┘
+
+Level 1: SQLite metadata ──→ Nebius LLM ──→ Freshness verification plan
+Level 2: SQLite metadata ──→ DataHub SDK ──→ Register datasets + tags + lineage
+Level 3: DataHub GraphQL + SQLite queries ──→ Nebius LLM diagnosis ──→ Update DataHub + alert owners
 ```
 
-The pipeline has **planted staleness**: `raw_trips` has data through 2016-03-10, but downstream tables are stuck at 2016-03-01 — a ~9 day gap.
+## Tech Stack
 
-### What It Does
+- **Python** — all scripts
+- **DataHub SDK** (`acryl-datahub`) — metadata emission via `DatahubRestEmitter`, verification via GraphQL
+- **Nebius Token Factory** — DeepSeek-R1-0528 via OpenAI-compatible API
+- **SQLite** — pipeline database (`nyc_taxi_pipeline.db`)
 
-1. **Introspects** the SQLite database — extracts table schemas, row counts, timestamp ranges
-2. **Builds context** — structures all metadata into a prompt-ready format with SLA definitions and the pipeline dependency graph
-3. **Calls Nebius LLM** — sends the context to DeepSeek-R1-0528 via the OpenAI-compatible API
-4. **Generates a plan** — the LLM returns a prioritized verification plan: which tables to check, what queries to run, what anomalies to look for
-5. **Saves a report** — outputs to console and writes a timestamped Markdown file in `reports/`
+## Dataset
 
-### Setup
+**NYC Taxi Pipeline** with planted staleness issues:
+
+| Table | Rows | Latest Data | Status |
+|-------|------|-------------|--------|
+| `raw_trips` | 250,000 | 2016-03-10 | Fresh |
+| `staging_trips` | 208,675 | 2016-03-01 | **9 days stale** |
+| `mart_daily_summary` | 41 | 2016-03-01 | **Stale (inherited)** |
+
+Additional anomalies: near-empty loads (2 rows on 2016-02-25), 335-day data gap, 16.5% row drop at staging.
+
+## What It Finds
+
+- `staging_trips` is **9 days behind** `raw_trips` — the ETL pipeline has stalled
+- `mart_daily_summary` inherits this staleness from its upstream
+- Multiple dates with near-zero row counts (empty/failed loads)
+- Large gaps in daily data coverage
+- 16.5% row filtering from raw to staging
+
+## Setup
 
 ```bash
 pip install -r requirements.txt
-export NEBIUS_API_KEY="your-key-here"
 ```
-
-### Run
-
-```bash
-python level1_freshness_plan.py
-```
-
-### Output
-
-The script prints the verification plan to the console and saves it as a Markdown report in `reports/freshness_plan_<timestamp>.md`.
-
-## Level 2: Write Freshness Status to DataHub
-
-Registers all pipeline tables as DataHub datasets with full metadata — schemas, lineage, freshness tags, and staleness descriptions — then verifies everything via GraphQL.
-
-### What It Does
-
-1. **Extracts metadata** from SQLite (reuses Level 1 introspection logic)
-2. **Computes staleness** by comparing each table's max timestamp against its upstream
-3. **Emits to DataHub** via the Python SDK (`DatahubRestEmitter`):
-   - **Dataset registration** — each table as a `sqlite` / `nyc_taxi_pipeline` dataset
-   - **Schema metadata** — column names and types from SQLite `PRAGMA table_info`
-   - **Lineage** — `raw_trips → staging_trips → mart_daily_summary`
-   - **Freshness tags** — `freshness:ok` or `freshness:critical_stale` per table
-   - **Descriptions** — human-readable staleness summaries (e.g. "STALE: 9 days behind upstream")
-   - **Custom properties** — row counts, SLA hours, staleness gap, pipeline stage
-4. **Verifies via GraphQL** — queries each dataset back and prints a summary
 
 ### Prerequisites
 
 - DataHub running locally (GMS at `localhost:8080`, UI at `localhost:9002`)
 - Auth token in `~/.datahubenv`
+- `NEBIUS_API_KEY` env var (optional — Level 3 falls back to rule-based diagnosis)
 
-### Run
+## How to Run
+
+Run the levels in order — Level 2 registers datasets that Level 3 reads back.
+
+### Level 1: Freshness Verification Plan
+
+Reads SQLite metadata, sends to Nebius LLM, generates a prioritized verification plan.
+
+```bash
+export NEBIUS_API_KEY="your-key"
+python level1_freshness_plan.py
+```
+
+Output: console + `reports/freshness_plan_<timestamp>.md`
+
+### Level 2: Write Back to DataHub
+
+Registers all 3 tables in DataHub with schemas, lineage, freshness tags, and descriptions.
 
 ```bash
 python level2_write_back.py
 ```
 
-### After Running
+After running: search `nyc_taxi_pipeline` in DataHub UI at `localhost:9002`.
 
-Search for `nyc_taxi_pipeline` or `freshness` in the DataHub UI at `localhost:9002` to see the registered datasets, lineage graph, and freshness tags.
+### Level 3: Freshness Audit Agent (Main Demo)
 
-## Level 3: Freshness Audit Agent
-
-The main demo script. A human-triggered agent that reads from DataHub, queries real data for evidence, gets an LLM diagnosis, then **acts** — updating DataHub and alerting owners.
-
-### What It Does
-
-1. **Reads FROM DataHub** (GraphQL) — fetches all 3 datasets with their tags, descriptions, lineage, and custom properties
-2. **Queries real data** (SQLite) — MAX timestamps, daily row counts, date gap detection, empty load detection, cross-stage row count comparison
-3. **LLM diagnosis** (Nebius DeepSeek-R1) — sends DataHub metadata + real evidence, gets back structured JSON with severity ratings and recommended actions. Falls back to rule-based diagnosis if `NEBIUS_API_KEY` is not set.
-4. **Acts on findings:**
-   - Updates DataHub tags based on diagnosis severity
-   - Writes incident reports as dataset descriptions in DataHub
-   - Prints Slack-style alerts addressed to `@data_platform_team`
-5. **Saves audit report** — full Markdown report with issue table, evidence, and actions taken
-
-### Key Difference from Level 1-2
-
-| | Level 1 | Level 2 | Level 3 |
-|---|---------|---------|---------|
-| **Reads from** | SQLite only | SQLite only | DataHub + SQLite |
-| **LLM role** | Generate plan | (none) | Diagnose issues |
-| **Writes to** | Console/file | DataHub | DataHub (updates) |
-| **Actions** | None | Register datasets | Update tags, alert owners |
-
-### Run
+The full agent loop — reads from DataHub, queries real data, gets LLM diagnosis, updates DataHub, alerts owners.
 
 ```bash
-# With LLM diagnosis:
+# With LLM:
 export NEBIUS_API_KEY="your-key"
 python level3_freshness_agent.py
 
@@ -108,6 +97,21 @@ python level3_freshness_agent.py
 python level3_freshness_agent.py
 ```
 
-### Sample Output
+Output: colored terminal with 5 phases, Slack-style alerts, `reports/freshness_audit_<timestamp>.md`
 
-The agent produces colored terminal output with 5 clear phases, Slack-style alert blocks, and saves a detailed Markdown report to `reports/freshness_audit_<timestamp>.md`.
+### Level Comparison
+
+| | Level 1 | Level 2 | Level 3 |
+|---|---------|---------|---------|
+| **Reads from** | SQLite | SQLite | DataHub + SQLite |
+| **LLM role** | Generate plan | — | Diagnose + severity |
+| **Writes to** | Console/file | DataHub | DataHub (updates) |
+| **Actions** | None | Register datasets | Update tags, alert owners |
+
+## Reliability
+
+Level 3 is hardened for live demos:
+- **Retries** LLM calls up to 3 times with progressively stricter prompts
+- **Strips** DeepSeek-R1 `<think>` tags and markdown fences before JSON parsing
+- **Falls back** to rule-based diagnosis if the LLM is unavailable or returns unparseable output
+- **Never crashes** — always produces a clean formatted report
