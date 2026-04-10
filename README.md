@@ -40,3 +40,35 @@ python level1_freshness_plan.py
 ### Output
 
 The script prints the verification plan to the console and saves it as a Markdown report in `reports/freshness_plan_<timestamp>.md`.
+
+## Level 2: Write Freshness Status to DataHub
+
+Registers all pipeline tables as DataHub datasets with full metadata — schemas, lineage, freshness tags, and staleness descriptions — then verifies everything via GraphQL.
+
+### What It Does
+
+1. **Extracts metadata** from SQLite (reuses Level 1 introspection logic)
+2. **Computes staleness** by comparing each table's max timestamp against its upstream
+3. **Emits to DataHub** via the Python SDK (`DatahubRestEmitter`):
+   - **Dataset registration** — each table as a `sqlite` / `nyc_taxi_pipeline` dataset
+   - **Schema metadata** — column names and types from SQLite `PRAGMA table_info`
+   - **Lineage** — `raw_trips → staging_trips → mart_daily_summary`
+   - **Freshness tags** — `freshness:ok` or `freshness:critical_stale` per table
+   - **Descriptions** — human-readable staleness summaries (e.g. "STALE: 9 days behind upstream")
+   - **Custom properties** — row counts, SLA hours, staleness gap, pipeline stage
+4. **Verifies via GraphQL** — queries each dataset back and prints a summary
+
+### Prerequisites
+
+- DataHub running locally (GMS at `localhost:8080`, UI at `localhost:9002`)
+- Auth token in `~/.datahubenv`
+
+### Run
+
+```bash
+python level2_write_back.py
+```
+
+### After Running
+
+Search for `nyc_taxi_pipeline` or `freshness` in the DataHub UI at `localhost:9002` to see the registered datasets, lineage graph, and freshness tags.
